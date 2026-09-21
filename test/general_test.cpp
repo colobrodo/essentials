@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <string>
 #include <cassert>
@@ -195,16 +196,95 @@ void test_allocator_exceptions() {
 }
 
 void test_json_lines_edge_cases() {
-    const char* file = "test_json_edge.jsonl";
+    auto read_file = [](char const* filename) {
+        std::ifstream input(filename, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input),
+                           std::istreambuf_iterator<char>());
+    };
+
+    const char* file = "test_json_nested.jsonl";
     {
         essentials::json_lines j;
         j.add("empty_string", "");
         j.add("zero_val", 0);
         j.add("bool_false", false);
+
+        auto object = j.add_object("my_object");
+        object.add("key", "value");
+        auto nested = object.add_object("nested");
+        nested.add("enabled", true);
+
+        auto array = object.add_array("items");
+        array.add("42");
+        auto array_object = array.add_object();
+        array_object.add("answer", 42);
+        auto nested_array = array.add_array();
+        nested_array.add(7);
+
+        object.add_object("empty_object");
+        object.add_array("empty_array");
         j.save_to_file(file);
     }
-    assert(essentials::file_size(file) > 0);
+    assert(read_file(file) ==
+           "{\"empty_string\": \"\", \"zero_val\": \"0\", "
+           "\"bool_false\": \"false\", \"my_object\": {\"key\": \"value\", "
+           "\"nested\": {\"enabled\": \"true\"}, \"items\": [\"42\", "
+           "{\"answer\": \"42\"}, [\"7\"]], \"empty_object\": {}, "
+           "\"empty_array\": []}}\n");
     std::remove(file);
+
+    const char* escaped_file = "test_json_escaped.jsonl";
+    {
+        essentials::json_lines j;
+        std::string value = "quote\" newline\n tab\t slash\\ control";
+        value.push_back('\x01');
+        j.add("key\"\\\n", value);
+        j.save_to_file(escaped_file);
+    }
+    assert(read_file(escaped_file) ==
+           "{\"key\\\"\\\\\\n\": \"quote\\\" newline\\n tab\\t slash\\\\ "
+           "control\\u0001\"}\n");
+    std::remove(escaped_file);
+
+    const char* stable_file = "test_json_stable_handles.jsonl";
+    {
+        essentials::json_lines j;
+        auto retained = j.add_object("retained");
+        for (int i = 0; i != 256; ++i) j.add("root", i);
+        j.new_line();
+        j.add("second", "line");
+        retained.add("late", "addition");
+        j.save_to_file(stable_file);
+    }
+    auto stable_output = read_file(stable_file);
+    assert(stable_output.find("\"retained\": {\"late\": \"addition\"}") !=
+           std::string::npos);
+    assert(stable_output.find("\n{\"second\": \"line\"}\n") !=
+           std::string::npos);
+    std::remove(stable_file);
+
+    const char* original_file = "test_json_original.jsonl";
+    const char* copy_file = "test_json_copy.jsonl";
+    {
+        essentials::json_lines original;
+        auto child = original.add_object("child");
+        child.add("shared_at_copy", 1);
+
+        essentials::json_lines copy = original;
+        child.add("original_only", 2);
+        copy.add("copy_only", 3);
+
+        original.save_to_file(original_file);
+        copy.save_to_file(copy_file);
+    }
+    assert(read_file(original_file) ==
+           "{\"child\": {\"shared_at_copy\": \"1\", "
+           "\"original_only\": \"2\"}}\n");
+    assert(read_file(copy_file) ==
+           "{\"child\": {\"shared_at_copy\": \"1\"}, "
+           "\"copy_only\": \"3\"}\n");
+    std::remove(original_file);
+    std::remove(copy_file);
 }
 
 int main() {

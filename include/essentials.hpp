@@ -6,8 +6,11 @@
 #include <fstream>
 #include <numeric>
 #include <random>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <memory>
+#include <utility>
 #include <vector>
 #include <dirent.h>
 #include <cstring>
@@ -196,29 +199,195 @@ template <typename T>
 inline constexpr bool is_owning_span_v = is_owning_span<T>::value;
 
 struct json_lines {
-    struct property {
-        property(std::string n, std::string v)
-            : name(n)
-            , value(v) {}
+    struct json_object;
+    struct json_array;
 
-        std::string name;
-        std::string value;
+private:
+    enum class json_type { object, array, scalar };
+
+    struct json_value {
+        explicit json_value(json_type type)
+            : type(type) {}
+
+        explicit json_value(std::string value)
+            : type(json_type::scalar)
+            , scalar(std::move(value)) {}
+
+        json_value(json_value const& other)
+            : type(other.type)
+            , scalar(other.scalar) {
+            object.reserve(other.object.size());
+            for (auto const& member : other.object) {
+                object.emplace_back(
+                    member.first, std::make_unique<json_value>(*member.second));
+            }
+
+            array.reserve(other.array.size());
+            for (auto const& element : other.array) {
+                array.emplace_back(std::make_unique<json_value>(*element));
+            }
+        }
+
+        json_value& operator=(json_value const& other) {
+            json_value copy(other);
+            swap(copy);
+            return *this;
+        }
+
+        json_value(json_value&&) noexcept = default;
+        json_value& operator=(json_value&&) noexcept = default;
+
+        void swap(json_value& other) noexcept {
+            std::swap(type, other.type);
+            scalar.swap(other.scalar);
+            object.swap(other.object);
+            array.swap(other.array);
+        }
+
+        json_type type;
+        std::string scalar;
+        std::vector<std::pair<std::string, std::unique_ptr<json_value>>> object;
+        std::vector<std::unique_ptr<json_value>> array;
     };
 
-    void new_line() { m_properties.push_back(std::vector<property>()); }
+    static std::string scalar_to_string(char const* value) {
+        return value;
+    }
+
+    static std::string scalar_to_string(std::string const& value) {
+        return value;
+    }
+
+    static std::string scalar_to_string(std::string_view value) {
+        return std::string(value);
+    }
+
+    static std::string scalar_to_string(bool value) {
+        return value ? "true" : "false";
+    }
 
     template <typename T>
-    void add(std::string name, T value) {
-        if (!m_properties.size()) {
-            new_line();
+    static std::enable_if_t<std::is_arithmetic<T>::value &&
+                                !std::is_same<T, bool>::value,
+                            std::string>
+    scalar_to_string(T value) {
+        return std::to_string(value);
+    }
+
+    static json_value& add_member(
+        json_value& object, std::string name, std::unique_ptr<json_value> value) {
+        assert(object.type == json_type::object);
+        auto* result = value.get();
+        object.object.emplace_back(std::move(name), std::move(value));
+        return *result;
+    }
+
+    static json_value& add_element(
+        json_value& array, std::unique_ptr<json_value> value) {
+        assert(array.type == json_type::array);
+        auto* result = value.get();
+        array.array.emplace_back(std::move(value));
+        return *result;
+    }
+
+    template <typename T>
+    static void add_scalar(json_value& object, std::string name, T const& value) {
+        add_member(object,
+                   std::move(name),
+                   std::make_unique<json_value>(scalar_to_string(value)));
+    }
+
+    template <typename T>
+    static void add_scalar(json_value& array, T const& value) {
+        add_element(array,
+                    std::make_unique<json_value>(scalar_to_string(value)));
+    }
+
+    json_value& current_line() {
+        if (m_lines.empty()) new_line();
+        return *m_lines.back();
+    }
+
+public:
+    struct json_object {
+        template <typename T>
+        void add(std::string name, T const& value) {
+            json_lines::add_scalar(*m_value, std::move(name), value);
         }
-        if constexpr (std::is_same<T, char const*>::value) {
-            m_properties.back().emplace_back(name, value);
-        } else if constexpr (std::is_same<T, bool>::value) {
-            m_properties.back().emplace_back(name, value ? "true" : "false");
-        } else {
-            m_properties.back().emplace_back(name, std::to_string(value));
+
+        json_object add_object(std::string name);
+        json_array add_array(std::string name);
+
+    private:
+        explicit json_object(json_value* value)
+            : m_value(value) {}
+
+        json_value* m_value;
+
+        friend struct json_lines;
+        friend struct json_array;
+    };
+
+    struct json_array {
+        template <typename T>
+        void add(T const& value) {
+            json_lines::add_scalar(*m_value, value);
         }
+
+        json_object add_object();
+        json_array add_array();
+
+    private:
+        explicit json_array(json_value* value)
+            : m_value(value) {}
+
+        json_value* m_value;
+
+        friend struct json_lines;
+        friend struct json_object;
+    };
+
+    json_lines() = default;
+
+    json_lines(json_lines const& other) {
+        m_lines.reserve(other.m_lines.size());
+        for (auto const& line : other.m_lines) {
+            m_lines.emplace_back(std::make_unique<json_value>(*line));
+        }
+    }
+
+    json_lines& operator=(json_lines const& other) {
+        json_lines copy(other);
+        swap(copy);
+        return *this;
+    }
+
+    json_lines(json_lines&&) noexcept = default;
+    json_lines& operator=(json_lines&&) noexcept = default;
+
+    void swap(json_lines& other) noexcept { m_lines.swap(other.m_lines); }
+
+    void new_line() {
+        m_lines.emplace_back(std::make_unique<json_value>(json_type::object));
+    }
+
+    template <typename T>
+    void add(std::string name, T const& value) {
+        add_scalar(current_line(), std::move(name), value);
+    }
+
+    json_object add_object(std::string name) {
+        auto& value = add_member(current_line(),
+                                 std::move(name),
+                                 std::make_unique<json_value>(json_type::object));
+        return json_object(&value);
+    }
+
+    json_array add_array(std::string name) {
+        auto& value = add_member(current_line(),
+                                 std::move(name),
+                                 std::make_unique<json_value>(json_type::array));
+        return json_array(&value);
     }
 
     void save_to_file(char const* filename) const {
@@ -227,33 +396,108 @@ struct json_lines {
         out.close();
     }
 
-    void print_line() const { print_line_to(m_properties.back(), std::cerr); }
+    void print_line() const { print_line_to(*m_lines.back(), std::cerr); }
 
     void print() const { print_to(std::cerr); }
 
 private:
-    std::vector<std::vector<property>> m_properties;
+    std::vector<std::unique_ptr<json_value>> m_lines;
 
     template <typename T>
-    void print_line_to(std::vector<property> const& properties, T& device) const {
-        device << "{";
-        for (uint64_t i = 0; i != properties.size(); ++i) {
-            auto const& p = properties[i];
-            device << "\"" << p.name << "\": \"" << p.value << "\"";
-            if (i != properties.size() - 1) {
-                device << ", ";
+    static void print_string_to(std::string const& string, T& device) {
+        static char const* hex = "0123456789abcdef";
+        device << '"';
+        for (unsigned char c : string) {
+            switch (c) {
+            case '"': device << "\\\""; break;
+            case '\\': device << "\\\\"; break;
+            case '\b': device << "\\b"; break;
+            case '\f': device << "\\f"; break;
+            case '\n': device << "\\n"; break;
+            case '\r': device << "\\r"; break;
+            case '\t': device << "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    device << "\\u00" << hex[c >> 4] << hex[c & 0x0f];
+                } else {
+                    device << static_cast<char>(c);
+                }
             }
         }
-        device << "}\n";
+        device << '"';
+    }
+
+    template <typename T>
+    static void print_value_to(json_value const& value, T& device) {
+        if (value.type == json_type::scalar) {
+            print_string_to(value.scalar, device);
+            return;
+        }
+
+        if (value.type == json_type::object) {
+            device << "{";
+            for (uint64_t i = 0; i != value.object.size(); ++i) {
+                auto const& member = value.object[i];
+                print_string_to(member.first, device);
+                device << ": ";
+                print_value_to(*member.second, device);
+                if (i != value.object.size() - 1) device << ", ";
+            }
+            device << "}";
+            return;
+        }
+
+        device << "[";
+        for (uint64_t i = 0; i != value.array.size(); ++i) {
+            print_value_to(*value.array[i], device);
+            if (i != value.array.size() - 1) device << ", ";
+        }
+        device << "]";
+    }
+
+    template <typename T>
+    void print_line_to(json_value const& line, T& device) const {
+        print_value_to(line, device);
+        device << '\n';
     }
 
     template <typename T>
     void print_to(T& device) const {
-        for (auto const& properties : m_properties) {
-            print_line_to(properties, device);
+        for (auto const& line : m_lines) {
+            print_line_to(*line, device);
         }
     }
 };
+
+inline json_lines::json_object json_lines::json_object::add_object(
+    std::string name) {
+    auto& value = json_lines::add_member(
+        *m_value,
+        std::move(name),
+        std::make_unique<json_value>(json_type::object));
+    return json_object(&value);
+}
+
+inline json_lines::json_array json_lines::json_object::add_array(
+    std::string name) {
+    auto& value = json_lines::add_member(
+        *m_value,
+        std::move(name),
+        std::make_unique<json_value>(json_type::array));
+    return json_array(&value);
+}
+
+inline json_lines::json_object json_lines::json_array::add_object() {
+    auto& value = json_lines::add_element(
+        *m_value, std::make_unique<json_value>(json_type::object));
+    return json_object(&value);
+}
+
+inline json_lines::json_array json_lines::json_array::add_array() {
+    auto& value = json_lines::add_element(
+        *m_value, std::make_unique<json_value>(json_type::array));
+    return json_array(&value);
+}
 
 template <typename ClockType, typename DurationType>
 struct timer {
